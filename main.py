@@ -3,29 +3,20 @@ from cryptocompare import cryptocompare
 import numpy as np
 
 
-def find_correlation(eth_subset, btc_data, stop):
+def find_correlation(eth_subset, btc_data):
     """
-    Делит btc_data (список движений цены BTCUSDT) на подмножества
-    Равные по количеству eth_subset для установления корреляции
-    между ними.
+    Находит коэффициент корреляции для периода движения цены
+    ETHUSDT - eth_subset по отношению к каждому из множества ближайших периодов
+    движения цены BTCUSDT - btc_data
 
     Для расчета используется цена закрытия периода.
-
-    :param eth_subset: подмножество движений цен ETHUSDT
-    :param btc_data: полный список движений цен BTCUSDT
-    :param stop: Устанавливает количество итераций по нахождению
-    коэффициента корреляции между eth_subset и btc_subset'тами
-    :return: True если движение цены eth_subset НЕ самостоятельное,
-    None если самостоятельное
     """
     step = len(eth_subset)
     eth_close_prices = [x['close'] for x in eth_subset]
-
-    for i in range(len(btc_data) // step):
-        if i == stop:
-            break
-
-        btc_subset = btc_data[0:step]
+    i = 0
+    j = step
+    for iteration in range(len(btc_data) // step):
+        btc_subset = btc_data[i:j]
         btc_close_prices = [x['close'] for x in btc_subset]
 
         if 0 in (np.std(btc_close_prices), np.std(eth_close_prices)):
@@ -39,31 +30,45 @@ def find_correlation(eth_subset, btc_data, stop):
         if correlation > 0.2:
             return True
 
-        for element in btc_subset:
-            btc_data.remove(element)
+        i += step
+        j += step
 
 
-def find_own_movements(eth_data, btc_data, step):
+def get_subset_by_depth(data: list, base_index: int, depth: int):
     """
-    Делит eth_data на eth_subset'ы - подмножества/периоды движения цены.
-    Передает eth_subset функции find_correlation для проверки самостоятельности
-    периода движения цены. Самостоятельные периоды складываются в own_movements.
+    Выделяет из множества движений цены ближайшие к подмножеству
+    движений цены другой монеты.
+    Размер возвращаемого массива задает depth
+    """
+    bottom_index = base_index - depth
+    upper_index = base_index + depth + 1
 
-    :param eth_data: Все периоды движения цены ETHUSDT
-    :param btc_data: Все периоды движения цены BTCUSDT
-    :param step: задает количество элементов в eth_subset
-    :return: Собственные движения цены ETHUSDT в виде списка own_movements
+    if bottom_index < 0:
+        bottom_index = 0
+    if upper_index > len(data) - 1:
+        upper_index = len(data) - 1
+
+    return data[bottom_index:upper_index]
+
+
+def find_own_movements(eth_data, btc_data, step, depth):
+    """
+    Делит все движения цены ETHUSDT на подмножества.
+    Высчитывает для каждого из них коэффицент корреляции с ближайшими
+    подмножествами движения цены BTCUSDT
     """
     own_movements = []
-    for i in range(len(eth_data) // step):
+    i = 0
+    j = step
+    for iteration in range(len(eth_data) // step):
         try:
-            subset = eth_data[0:step]
+            btc_subset = get_subset_by_depth(btc_data, i, depth)
+            eth_subset = eth_data[i:j]
+            if not find_correlation(eth_subset, copy.copy(btc_subset)):
+                own_movements += eth_subset
+            i += step
+            j += step
 
-            if not find_correlation(subset, btc_data, 5):
-                own_movements += subset
-
-            for element in subset:
-                eth_data.remove(element)
         except IndexError:
             pass
 
@@ -78,11 +83,9 @@ if __name__ == '__main__':
     own_movements = find_own_movements(
         copy.copy(eth_candles),
         copy.copy(btc_candles),
-        2
+        2,
+        4
     )
-    # Распечатка каждого из собственных движений
-    for movement in own_movements:
-        print(movement)
 
     print(
         '\nНайдено',
