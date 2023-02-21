@@ -1,106 +1,161 @@
-import copy
-from cryptocompare import cryptocompare
-import numpy as np
+import threading
+import time
+from abc import ABCMeta, abstractmethod
+from datetime import datetime
+from correlation import main
 
 
-def find_correlation(eth_subset, btc_data):
+class BaseDisplay(metaclass=ABCMeta):
     """
-    Находит коэффициент корреляции для периода движения цены
-    ETHUSDT - eth_subset по отношению к каждому из множества ближайших периодов
-    движения цены BTCUSDT - btc_data
-
-    Для расчета используется цена закрытия периода.
+    Абстрактный Базовый класс "наблюдателя"
     """
-    step = len(eth_subset)
-    eth_close_prices = [x['close'] for x in eth_subset]
-    i = 0
-    j = step
-    for iteration in range(len(btc_data) // step):
-        btc_subset = btc_data[i:j]
-        btc_close_prices = [x['close'] for x in btc_subset]
+    def __init__(self):
+        self.price_changes = []
 
-        if 0 in (np.std(btc_close_prices), np.std(eth_close_prices)):
-            continue
-
-        correlation = np.corrcoef(
-            eth_close_prices,
-            btc_close_prices
-        )[1, 0]
-
-        if correlation > 0.2:
-            return True
-
-        i += step
-        j += step
+    @abstractmethod
+    def update(self, data) -> None:
+        """
+        Получение новых данных от наблюдаемого
+        """
+        pass
 
 
-def get_subset_by_depth(data: list, base_index: int, depth: int):
+class BaseCoinParser(metaclass=ABCMeta):
     """
-    Выделяет из множества движений цены ближайшие к подмножеству
-    движений цены другой монеты.
-    Размер возвращаемого массива задает depth
+    Абстрактный Базовый класс "наблюдаемого"
     """
-    bottom_index = base_index - depth
-    upper_index = base_index + depth + 1
+    @abstractmethod
+    def __init__(self) -> None:
+        self.observers = []
 
-    if bottom_index < 0:
-        bottom_index = 0
-    if upper_index > len(data) - 1:
-        upper_index = len(data) - 1
+    def register(self, observer: BaseDisplay) -> None:
+        self.observers.append(observer)
 
-    return data[bottom_index:upper_index]
+    def notify_display(self, data) -> None:
+        for observer in self.observers:
+            observer.update(data)
+
+    @abstractmethod
+    def parse(self):
+        pass
 
 
-def find_own_movements(eth_data, btc_data, step, depth):
-    """
-    Делит все движения цены ETHUSDT на подмножества.
-    Высчитывает для каждого из них коэффицент корреляции с ближайшими
-    подмножествами движения цены BTCUSDT
-    """
-    own_movements = []
-    i = 0
-    j = step
-    for iteration in range(len(eth_data) // step):
-        try:
-            btc_subset = get_subset_by_depth(btc_data, i, depth)
-            eth_subset = eth_data[i:j]
-            if not find_correlation(eth_subset, copy.copy(btc_subset)):
-                own_movements += eth_subset
-            i += step
-            j += step
+class CorrelationParser(BaseCoinParser):
+    def __init__(self, observer: BaseDisplay):
+        self.display = observer
 
-        except IndexError:
-            pass
+    def register(self, observer: BaseDisplay):
+        self.display = observer
 
-    return own_movements
+    def notify_display(self, data):
+        """
+        Создаем поток для обновления и вывода данных в дисплее
+        и продолжаем парсить.
+        :param data: новые данные для дисплея
+        :return:
+        """
+        output_t = threading.Thread(target=self.display.update, args=(data,))
+        output_t.start()
+        time.sleep(0.01)
+
+    def parse(self):
+        """
+        Получаем собственные движения от модуля
+        из задания 1.
+        Функция get_price_changes() выдаст
+        только те из них, которые мы еще не сохраняли
+        в дисплее и те, амплитуда которых выше или равна 1%.
+        """
+        movements = self.get_price_changes()
+        if not movements:
+            return
+        for movement_subset in movements:
+            # переводим данные в удобный для дисплея формат
+            data = self.get_movement_data(movement_subset)
+            self.notify_display(data)
+
+    def get_price_changes(self):
+        own_movements = main(60)
+        if not own_movements:
+            return
+        own_movements = self.validate_changes(own_movements)
+        return own_movements
+
+    def validate_changes(self, movements):
+        unique_movements = []
+        for movements_subset in movements:
+            if self.in_display(movements_subset):
+                continue
+            # цена открытия периода и цена его закрытия
+            open_price = movements_subset[0]['open']
+            close_price = movements_subset[-1]['close']
+
+            percent = self.get_percent(close_price, open_price)
+            movements_subset.append(percent)
+
+            if abs(percent) >= 1:
+                unique_movements.append(movements_subset)
+        return unique_movements
+
+    def get_movement_data(self, movements_subset):
+        percent = movements_subset.pop()
+        time_data = self.get_time_data(movements_subset)
+        text_template = 'Собственное изменение цены на {}% c {} по {}'
+        if percent in (1, -1):
+            text_template = '! ' + text_template + ' !'
+        notification = text_template.format(percent, time_data['start'], time_data['end'])
+        data = {
+            'notification': notification,
+            'percent': percent,
+            'movements': movements_subset,
+            'display': True
+        }
+        return data
+
+    @staticmethod
+    def get_time_data(movement_subset):
+        unix_start = int(movement_subset[0]['time'])
+        unix_end = int(movement_subset[-1]['time'])
+
+        time_data = {
+            'start': datetime.utcfromtimestamp(
+                unix_start
+            ).strftime('%H:%M:%S'),
+
+            'end': datetime.utcfromtimestamp(
+                unix_end
+            ).strftime('%H:%M:%S')
+        }
+
+        return time_data
+
+    @staticmethod
+    def get_percent(close, _open):
+        if close > _open:
+            result = (close - _open) / _open * 100
+        else:
+            result = (_open - close) / _open * 100
+            result = result * -1
+        return round(result, 2)
+
+    def in_display(self, new_data):
+        for data in self.display.price_changes:
+            if data['movements'][0]['time'] == new_data[0]['time']:
+                return True
+
+
+class CorrelationDisplay(BaseDisplay):
+    def update(self, data):
+        self.price_changes.append(data)
+        for data in self.price_changes:
+            if data['display']:
+                data['display'] = False
+                print(data['notification'])
 
 
 if __name__ == '__main__':
-    # Получить все движения цен ETHUSDT/BTCUSDT
-    eth_candles = cryptocompare.get_historical_price_minute('ETH', currency='USDT', limit=1440)
-    btc_candles = cryptocompare.get_historical_price_minute('BTC', currency='USDT', limit=1440)
-    # Запуск алгоритма поиска собственных движений цены ETHUSDT
-    own_movements = find_own_movements(
-        copy.copy(eth_candles),
-        copy.copy(btc_candles),
-        2,
-        4
-    )
-
-    print(
-        '\nНайдено',
-        len(own_movements),
-        'самостоятельных движений цены ETHUSDT длинной в 1 минуту.'
-    )
-    print(
-        'Поиск осуществлен по',
-        len(eth_candles),
-        'одноминутным движениям цены'
-    )
-    # Коэффициент общей корреляции ETHUSDT/BTCUSDT
-    corrcoef = np.corrcoef(
-        [x['close'] for x in eth_candles],
-        [x['close'] for x in btc_candles]
-    )[1, 0]
-
-    print('\nКоэффициент корреляции ETHUSDT/BTCUSDT', corrcoef)
+    display = CorrelationDisplay()
+    parser = CorrelationParser(display)
+    print('Поиск собственных изменений цены на 1% и более')
+    while True:
+        parser.parse()
